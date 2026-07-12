@@ -4,6 +4,7 @@
 
 set -euo pipefail
 
+# 脚本在 scripts/setup.sh，SKILL_DIR 是 skill 根目录（父级）
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$SKILL_DIR/.env"
 ENV_EXAMPLE="$SKILL_DIR/.env.example"
@@ -15,10 +16,11 @@ if [[ ! -f "$ENV_EXAMPLE" ]]; then
 fi
 
 # v3.1.2: regex 支持多 key（sk-a,sk-b,sk-c），原 regex 只匹配单 key
+# v3.2.x: IFS= 让 read 保留前后空格；|| true 兜底 stdin EOF 让 set -e 不中断
 if [[ -f "$ENV_FILE" ]] && grep -qE '^AGNES_API_KEY=(sk-[A-Za-z0-9_-]{10,})(,sk-[A-Za-z0-9_-]{10,})*$' "$ENV_FILE"; then
     echo "✅ .env 已有有效 key（不打印内容，避免泄漏）"
-    read -rp "要覆盖吗？[y/N] " overwrite
-    if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
+    read -rp "要覆盖吗？[y/N] " overwrite || true
+    if [[ ! "${overwrite:-}" =~ ^[Yy]$ ]]; then
         echo "👌 保留现有 key，退出"
         exit 0
     fi
@@ -34,7 +36,7 @@ echo
 echo "请输入你的 Agnes API Key（形如 sk-xxx）："
 echo "  - 多个 key 用逗号分隔（自动轮换）"
 echo "  - 留空跳过手动输入，事后编辑 .env"
-read -rp "AGNES_API_KEY=" input_key
+read -rp "AGNES_API_KEY=" input_key || true
 
 if [[ -n "$input_key" ]]; then
     # 替换占位符

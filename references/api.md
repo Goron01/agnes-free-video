@@ -140,15 +140,20 @@ GET  https://apihub.agnes-ai.com/v1/videos/{task_id}
 | Field | Type | Notes |
 | --- | --- | --- |
 | `id` | string | 任务 ID |
-| `video_id` | string | 视频 ID（推荐查询用） |
+| `video_id` | string | 视频 ID（推荐查询用，实测可能是 `task_xxx` 前缀，跟 `id`/`task_id` 同值） |
 | `model` | string | 使用的模型 |
 | `object` | string | 通常 `"video"` |
 | `status` | string | 任务状态 |
 | `progress` | integer | 进度 0-100 |
+| `internal_status` | string | 仅 status 接口返，内部状态（如 `inference`/`completed`） |
+| `internal_progress` | integer | 仅 status 接口返 |
 | `seconds` | string | 视频时长（秒） |
 | `size` | string | 视频分辨率 |
-| `video_url` | string | **最终视频 URL**（completed 时可用） |
-| `remixed_from_video_id` | string | 某些响应里**实际是视频 URL**（文档字段名错乱，脚本已智能识别） |
+| `size_mapping` | object | 尺寸自动调整记录（requested → actual） |
+| `metadata` | object | ⭐ **当前主要接口把 url 藏在这里**（`metadata.url`），脚本 v3.2.x 已智能识别 |
+| `metadata.url` | string | **最终视频 URL**（completed 时可用） |
+| `video_url` | string | 部分接口返，文档字段名错乱 |
+| `remixed_from_video_id` | string | 某些响应里**实际是视频 URL**（文档字段名错乱） |
 | `error` | object \| null | 失败时返回 |
 
 > **脚本智能识别**：尝试 `video_url` → `url` → `remixed_from_video_id` → `video` → `output_url` → 嵌套 `data.*` 多种字段名。

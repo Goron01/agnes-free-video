@@ -1,6 +1,6 @@
 ---
 name: agnes-free-video
-version: 3.2.0
+version: 3.2.1
 description: "Agnes-Video 文生视频/图生视频/关键帧。v3.2.0 起 4 key 粘性轮换（RPM=1 安全）。触发：文生视频、图生视频"
 ---
 

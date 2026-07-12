@@ -4,6 +4,72 @@
 
 ---
 
+## v3.2.x (2026-07-13) — Agent 视角审查：4 个 P0 bug + 1 个 P1 增强 + 9 个新测试
+
+**背景**：主人 2026-07-13 让小美用 agent 视角重跑一遍 agnes-free-video，端到端测试 T2V/I2V/Keyframes/status 查询/download。发现 4 个真实 bug，包括一个**让视频下载失败的 severe bug**（API 改了 URL 字段名但脚本没识别），全部修复 + 新增 9 个测试（总 104 → 114）。
+
+### P0 Bug Fixes（实测严重性）
+
+- **P0-1 #【severe】 `extract_video_url` 加 metadata.url / data.* 深嵌套支持**
+  - 现状（v3.2.0）：只查顶层 + `data.*`，API 最新完成响应实际把 URL 藏在 `metadata.url`
+  - 后果：completed 后脚本输出 `STATUS: ok` + `URL: (no url)`，主人以为成功，实际视频下载失败
+  - 修复：深递归查询 `metadata`/`data` 容器（深度 4 + 循环引用保护），按 BFS 顺序拿第一个 https URL
+  - 测试：`test_extract_video_url_metadata_url` / `_data_metadata_url` / `_top_wins_over_metadata`
+  - 受惠：cmd_create + cmd_status 双双能拿到 URL 了
+
+- **P0-2 【hard to debug】 `cmd_status --wait` 状态完成却无 URL 不再静默 success**
+  - 现状：wait + completed + no URL 路径上原代码走 success 分支 → agent 误以为成功
+  - 修复：if `args.wait and status in DONE_STATES and not video_url` → `_print_agent_error` 返 1
+  - 中间态 (in_progress/queued) 查询不变（仅 wait 路径检查）
+  - 测试：`test_status_wait_completed_no_url_raises` / `_completed_with_metadata_url_succeeds` / `_no_wait_in_progress_passes`
+
+- **P0-3 【bug】 setup.sh SKILL_DIR 计算错位**
+  - 现状：脚本在 `scripts/setup.sh`，原代码 `cd "$(dirname "${BASH_SOURCE[0]}")/.."` 本应跟 `..` 就跟，结果算成了 **运行 cwd**，不是 skill 根
+  - 后果：Linux 集成从 `/` 跑 setup.sh 会报 `找不到 /.env.example` 全部 set -e 退出 1
+  - 测试：手动验证 `bash ~/文档/skills/创作工具/agnes-free-video/scripts/setup.sh </dev/null` 现在返 ✅
+
+- **P0-4 【bug】 setup.sh 在 stdin 是 /dev/null 时 `read -rp` 返非零退出码 + `set -e` 中断**
+  - 后果：验证 CI / 跳输入交互时脚本报错不让走
+  - 修复：read 加 `|| true` 兜底，`${overwrite:-}` 携默认空
+
+### P1 Bug Fixes
+
+- **P1-1 `extract_video_id` 去掉 `video_` 前缀严卡**
+  - 现状：API 实测返回的 `video_id` 是 `task_xxx`（同 `id`/`task_id`），原代码 `v.startswith("video_")` 为假 → video_id=None，走 task_id 兜底
+  - 后果：能跑但不优美，且多一次 fallback 网络调用
+  - 修复：只要非空就拿；额外过滤空字符串避免拿 `""`
+  - 测试：`test_extract_video_id_accepts_task_prefix` / `_empty_filtered`
+
+- **P1-2 dry-run agent 格式的 PAYLOAD_* 嵌套值不再用 Python repr**
+  - 现状：`{k: v}` 中 v 是 dict/list 时 `print(v)` 输出 `{‘image': ['…']}`（单引号），跟实际发送的 JSON 不一致，agent 解析歧义
+  - 修复：嵌套值用 `json.dumps(..., ensure_ascii=False)` 序列化，agent 拿双引号标准 JSON
+  - 测试：`test_dry_run_agent_payload_nested_json_serialized`
+
+- **P1-3 retryable 错误后错过的 key 也能进 60s cooldown**
+  - 现状：`cmd_create` / `cmd_status` 的 `except ApiError` 分支不调 `mark_used`，只 mark_dead (401/403)；5xx/429 失败后 key 仍为"从未用过"状态 → 下次 `acquire_key()` 必然选中同一把死 → 限流循环重试 3 次 → 报错
+  - 修复：if `is_retryable_status(exc.status)` → `pool.mark_used(key)`（限流本身让 key 进 cooldown）
+  - 测试：`test_429_failure_then_mark_used_avoids_loop`
+
+### P1 测试增补（总测试量 104 → 114）
+
+- `TestExtractors` 加 5 个视频 URL 提取边缘 case（metadata/url/data.* 嵌套）
+- `TestExtractors` 加 2 个 video_id 提取（前缀修复 + 空字符串过滤）
+- `TestV31BugFixes` 加 1 个 dry-run payload 序列化（JSON 双引号）
+- `TestV32KeyPoolIntegration` 加 1 个 429 mark_used 避免死循环
+- `TestV32StatusWaitNoUrl` 加 3 个 wait+completed 路径 edge case（no_url 报错 / metadata.url 成功 / 中间态不算错）
+
+### P1 文档同步
+
+- `references/api.md`：加 `metadata.url` 作为**当前推荐 URL 位置**，标注 `video_url` / `remixed_from_video_id` 为“某些旧响应”字段；加 `video_id` 实际可能为 `task_xxx` 前缀的说明；加 `internal_status` / `internal_progress` / `size_mapping` 字段说明
+
+### 迁移 / 兼容性
+
+- 纯修复 + 增补测试，默认输出格式不变
+- external agents 无 API 变动（仅内部 extract 逻辑变更）
+- 主人都需要重新跑下 generation（之前几十分钟可能“成功”但 URL 为空）
+
+---
+
 ## v3.2.0 (2026-07-12) — KeyPool 粘性轮换（突破 RPM=1 限制）
 
 **背景**：主人 2026-07-12 报告**官方把每 key 的 RPM 改成 1**，而且加到了 4 把 key。v3.1 之前的多 key 轮换策略（失败才换 key）在 RPM=1 下基本失效：

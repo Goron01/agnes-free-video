@@ -475,12 +475,20 @@ def extract_task_id(response: dict[str, Any]) -> Optional[str]:
 
 
 def extract_video_id(response: dict[str, Any]) -> Optional[str]:
-    """新 API 文档：video_id 才是推荐查询 ID"""
+    """提取 video_id（推荐查询用）
+
+    v3.2.x 修：API 实测 video_id 可能是 `video_xxx`、`task_xxx` 或其他标识符，
+    只要非空就拿，不再过滤前缀。原代码严卡 `video_` 前缀，致 video_id=None，
+    走 task_id 兜底有效但委托到 fallback 路径，不美观。
+    """
     for key in ("video_id", "id", "task_id"):
         v = response.get(key)
-        if isinstance(v, str) and v.startswith("video_"):
+        if isinstance(v, str) and v.strip():
             return v
-    return _deep_get(response, "data", "video_id")
+    nested = _deep_get(response, "data", "video_id")
+    if isinstance(nested, str) and nested.strip():
+        return nested
+    return None
 
 
 def extract_status(response: dict[str, Any]) -> str:
@@ -502,24 +510,45 @@ def extract_progress(response: dict[str, Any]) -> Optional[int]:
 
 
 # 视频 URL 字段候选（按文档/历史响应模式排序）
+# v3.2.x 实测：最新 API completed 响应把 url 藏在 metadata.url（不是顶层 url）
+# （v3.0 时报 references/api.md 顶层 video_url，已变动）
 VIDEO_URL_KEYS = ("video_url", "url", "remixed_from_video_id", "video", "output_url")
+# 嵌套容器 key（深递归时跳进去找 url，避免 data.metadata.url 瀰）
+_RECURSE_CONTAINERS = ("metadata", "data")
+_MAX_RECURSE_DEPTH = 4  # 数据 / metadata / 调参，正常响应最多 3-4 层
 
 
 def extract_video_url(response: dict[str, Any]) -> Optional[str]:
-    """智能识别视频 URL：尝试多种字段名 + 嵌套 data"""
+    """智能识别视频 URL：尝试顶层 + 深嵌套 metadata/data.url
+
+    v3.2.x 加 metadata.url（API 0. 最新位置）：它可能藏在
+    metadata.url / data.metadata.url / data.url / 任何巢套容器里的 url。
+    从顶层开始 BFS，找第一个 https:// 串就返。
+    """
     if not isinstance(response, dict):
         return None
-    for key in VIDEO_URL_KEYS:
-        v = response.get(key)
-        if isinstance(v, str) and v.startswith(("http://", "https://")):
-            return v
-    # 嵌套 data
-    data = response.get("data")
-    if isinstance(data, dict):
+    stack: list[tuple[Any, int]] = [(response, 0)]
+    seen: set[int] = set()
+    while stack:
+        node, depth = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        # 避免循环引用（response 本身或反身指向）
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        # 1. 当前节点查 VIDEO_URL_KEYS（顶层有最高优先级——AVS 容器拿下节点不优先）
         for key in VIDEO_URL_KEYS:
-            v = data.get(key)
+            v = node.get(key)
             if isinstance(v, str) and v.startswith(("http://", "https://")):
                 return v
+        # 2. 推进嵌套容器（优先 metadata > data，因为状态量都抽别的为一展其填）
+        if depth >= _MAX_RECURSE_DEPTH:
+            continue
+        for container in _RECURSE_CONTAINERS:
+            sub = node.get(container)
+            if isinstance(sub, dict):
+                stack.append((sub, depth + 1))
     return None
 
 
@@ -817,8 +846,11 @@ def cmd_create(args: argparse.Namespace) -> int:
             print("NOTE: request not sent; payload shown below")
             print(f"PROMPT: {args.prompt}")
             # 把 payload 放最后（agent 可以选择忽略）
+            # v3.2.x: 用 JSON dumps 而不是 repr，避免 dict 列表值变成单引号
+            # （agent 解析失败，且和 actual API request body 不一致）
             for k, v in payload.items():
-                print(f"PAYLOAD_{k.upper()}: {v}")
+                encoded = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                print(f"PAYLOAD_{k.upper()}: {encoded}")
             return 0
         url = f"{args.api_base.rstrip('/')}/v1/videos"
         print(json.dumps({"url": url, "payload": payload}, ensure_ascii=False, indent=2))
@@ -855,6 +887,9 @@ def cmd_create(args: argparse.Namespace) -> int:
             continue
         except ApiError as exc:
             # 其他错误（4xx 业务、5xx 重试耗尽等）→ 不换 key，直接报
+            # v3.2.x: retryable (5xx/429/网络) 错误后 mark_used 进 60s cooldown
+            if exc.status and is_retryable_status(exc.status):
+                pool.mark_used(key)
             if args.format == "agent":
                 _print_agent_error(str(exc), exc.status)
                 return 1
@@ -919,6 +954,10 @@ def cmd_create(args: argparse.Namespace) -> int:
                 return 1
             continue
         except ApiError as exc:
+            # v3.2.x: 429/5xx 等 retryable 错误抛 ApiError 后也要 mark_used
+            # （否则这把 key 不进 60s cooldown，下个任务立刻又选中它，再被限流死循环）
+            if exc.status and is_retryable_status(exc.status):
+                pool.mark_used(key)
             if args.format == "agent":
                 _print_agent_error(str(exc), exc.status)
                 return 1
@@ -1022,6 +1061,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             )
             continue
         except ApiError as exc:
+            # v3.2.x: retryable 错误后也要 mark_used（避免下次拿同一把重被限流）
+            if exc.status and is_retryable_status(exc.status):
+                pool.mark_used(key)
             if args.format == "agent":
                 _print_agent_error(str(exc), exc.status)
                 return 1
@@ -1041,6 +1083,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 1
 
     video_url = extract_video_url(final)
+    # v3.2.x: 如果是 --wait 查到终态但没 URL，报错（避免 agent 看到 false success）
+    final_status = extract_status(final)
+    if args.wait and final_status in DONE_STATES and not video_url:
+        msg = f"Task ended in '{final_status}' but no video URL in response"
+        if args.format == "agent":
+            _print_agent_error(msg)
+            return 1
+        print(f"Error: {msg}\n{json.dumps(final, ensure_ascii=False, indent=2)}", file=sys.stderr)
+        return 1
+
     if video_url and (args.output or args.output_dir or args.download):
         path = download_video(
             video_url,

@@ -163,6 +163,61 @@ class TestExtractors(unittest.TestCase):
             "https://gcs.example.com/v.mp4",
         )
 
+    def test_extract_video_url_metadata_url(self):
+        """v3.2.x bug fix: 最新 API 实际把 URL 藏在 metadata.url 字段"""
+        r = {
+            "id": "task_xxx",
+            "status": "completed",
+            "metadata": {"url": "https://platform-outputs.agnes-ai.space/v.mp4"},
+        }
+        self.assertEqual(
+            agnes_video.extract_video_url(r),
+            "https://platform-outputs.agnes-ai.space/v.mp4",
+        )
+
+    def test_extract_video_url_data_metadata_url(self):
+        """v3.2.x: metadata 嵌套在 data 下也能识别"""
+        r = {
+            "data": {
+                "status": "completed",
+                "metadata": {"url": "https://gcs.example.com/v.mp4"},
+            }
+        }
+        self.assertEqual(
+            agnes_video.extract_video_url(r),
+            "https://gcs.example.com/v.mp4",
+        )
+
+    def test_extract_video_url_top_wins_over_metadata(self):
+        """v3.2.x: 优先级仍以顶层字段为准（不要优先 metadata.url）"""
+        r = {
+            "video_url": "https://gcs.example.com/top.mp4",
+            "metadata": {"url": "https://gcs.example.com/wrong.mp4"},
+        }
+        self.assertEqual(
+            agnes_video.extract_video_url(r),
+            "https://gcs.example.com/top.mp4",
+        )
+
+    def test_extract_video_id_accepts_task_prefix(self):
+        """v3.2.x bug fix: API 实际返回 task_xxx 作为 video_id，
+        原实现严卡 video_ 前缀，导致 video_id=None 走 task_id 兜底"""
+        r = {
+            "id": "task_OBl4fLcBa5vIILcTFcaMJ96s1KiGPwb0",
+            "video_id": "task_OBl4fLcBa5vIILcTFcaMJ96s1KiGPwb0",
+            "task_id": "task_OBl4fLcBa5vIILcTFcaMJ96s1KiGPwb0",
+        }
+        # 不管前缀，只要非空就拿
+        self.assertEqual(
+            agnes_video.extract_video_id(r),
+            "task_OBl4fLcBa5vIILcTFcaMJ96s1KiGPwb0",
+        )
+
+    def test_extract_video_id_empty_filtered(self):
+        """v3.2.x: 空字符串应该当成 None（免让 API 返空字符串污染查询 URL）"""
+        r = {"video_id": "", "id": "task_xxx"}
+        self.assertEqual(agnes_video.extract_video_id(r), "task_xxx")
+
 
 # ============================================================================
 # TestApiKey: Key 池管理
@@ -451,6 +506,29 @@ class TestV31BugFixes(unittest.TestCase):
             agnes_video.DEFAULT_OUTPUT_DIR,
             "/home/goron/文档/Openclaw/输出/agnes-free-video",
         )
+
+    # P3-A: dry-run agent 格式 payload 嵌套值用 JSON 序列化（双引号）
+    def test_dry_run_agent_payload_nested_json_serialized(self):
+        """v3.2.x: extra_body 等嵌套值必须用 JSON 双引号序列化，
+        不能用 Python repr 单引号（agent 解析可靠 + 跟实际 request 一致）"""
+        r = self._run(
+            "create", "--prompt", "t",
+            "--image-url", "https://a/k1.png",
+            "--image-url", "https://a/k2.png",
+            "--mode", "keyframes",
+            "--dry-run", "--format", "agent",
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+        # 找到 PAYLOAD_EXTRA_BODY 一行
+        lines = [l for l in r.stdout.splitlines() if l.startswith("PAYLOAD_EXTRA_BODY:")]
+        self.assertEqual(len(lines), 1, f"PAYLOAD_EXTRA_BODY line not found in:\n{r.stdout}")
+        line = lines[0]
+        # 应该是 JSON 格式（双引号），不是 Python repr 单引号
+        self.assertIn('"image"', line, f"Expected double-quoted JSON keys, got: {line}")
+        self.assertIn('"mode"', line)
+        self.assertIn('"keyframes"', line)
+        # 原 bug 是用 repr 时会输出单引号
+        self.assertNotIn("{'image'", line)
 
 
 # ============================================================================
@@ -973,6 +1051,109 @@ class TestV32KeyPoolIntegration(unittest.TestCase):
             # 成功后才调 mark_used
             pool.mark_used(key)
             self.assertGreater(pool._last_used[key], 0.0)
+
+    def test_429_failure_then_mark_used_avoids_loop(self):
+        """v3.2.x bug fix: cmd_create 里 429 耗尽重试后要 mark_used，
+        避免下个任务立刻又选中同一把死 key。
+
+        背景：原代码 ApiError 分支只 mark_dead（401/403），不 mark_used，
+        导致 429/5xx 耗尽重试的那把 key 仍处于"未用过"状态，
+        下次 acquire 会被再次选中 → 必然又遇 429 → 死循环重试 3 次 → 报错。
+        修复：retryable 状态码后调 mark_used 进 60s cooldown，
+        下个任务会选下一把 key。
+        """
+        from unittest import mock
+        keys = ["sk-loop-a", "sk-loop-b"]
+        pool = agnes_video.get_key_pool(keys)
+        # 预制：按顺序都“限流”失败
+        first = pool.acquire_key(verbose=False)
+        # 直接验证 cmd_create 的 except 分支调 mark_used
+        fake_curl = mock.MagicMock(return_value=(429, '{"message":"rate limit"}'))
+        with mock.patch.object(agnes_video, "curl_request", fake_curl), \
+             mock.patch.object(agnes_video, "request_json_with_retry",
+                               side_effect=agnes_video.ApiError("rate limit", status=429)):
+            r = agnes_video.cmd_create(argparse.Namespace(
+                prompt="t", image_url=None, mode=None,
+                height=768, width=1152, num_frames=81, num_inference_steps=None,
+                seed=None, frame_rate=24, negative_prompt=None,
+                output=None, output_dir=None, download=False, no_poll=True,
+                poll_interval=5, timeout=180, max_retries=1, api_base="https://api",
+                dry_run=False, format="agent", payload=None,  # payload=None 仅允许 no-poll
+            ))
+            self.assertEqual(r, 1)
+        # 关键验证：限流那把 key 被调了 mark_used（进 60s cooldown）
+        self.assertGreater(pool._last_used[first], 0.0,
+                           "429 后必须调 mark_used 让 key 进 cooldown，否则下次还会选中")
+
+
+class TestV32StatusWaitNoUrl(unittest.TestCase):
+    """v3.2.x bug fix: status --wait 到 completed 却无 URL 不应静默返 success
+
+    背景：主人 2026-07-13 实测，最新 API 完成响应里 video_url 实际位置变成
+    metadata.url，原 extract_video_url 只看顶层+data，返 None。
+    cmd_status 原代码不管 status 是不是 done 都照输出 success，给 agent
+    造成 false success（STATUS: ok + URL: (no url)）。现在：wait 到 done + 无 URL
+    → 报错退出 1。
+    """
+
+    def test_status_wait_completed_no_url_raises(self):
+        """wait 拿到 completed 但无 URL（Video_url/metadata.url 都没有）→ 报错"""
+        # mock 轮询只返一次：completed 但响应里没有 URL 任何位置
+        from unittest import mock
+        def fake_curl(url, **kw):
+            return 200, '{"status":"completed","progress":100,"id":"task_x","task_id":"task_x"}'
+        # mock download_video 不被调用（避免动到本地文件）
+        with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl), \
+             mock.patch.object(agnes_video, "download_video", return_value=None):
+            # 让 poll 快速退出
+            r = agnes_video.cmd_status(argparse.Namespace(
+                video_id=None, task_id="task_x",
+                wait=True, poll_interval=0.01, timeout=5, max_retries=1,
+                download=False, output=None, output_dir=None,
+                api_base="https://api", format="agent",
+            ))
+            self.assertEqual(r, 1)
+
+    def test_status_wait_completed_with_metadata_url_succeeds(self):
+        """wait 拿到 completed + metadata.url 照常成功"""
+        from unittest import mock
+        captured_out: dict = {}
+        def fake_curl(url, **kw):
+            captured_out["url"] = url
+            return 200, '{"status":"completed","progress":100,"metadata":{"url":"https://platform.example.com/v.mp4"}}'
+        with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl), \
+             mock.patch.object(agnes_video, "download_video", return_value=None), \
+             mock.patch("sys.stdout", new=mock.MagicMock()) as mock_stdout:
+            r = agnes_video.cmd_status(argparse.Namespace(
+                video_id="task_x", task_id=None,
+                wait=True, poll_interval=0.01, timeout=5, max_retries=1,
+                download=False, output=None, output_dir=None,
+                api_base="https://api", format="agent",
+            ))
+            self.assertEqual(r, 0)
+            # URL: 应输出
+            written = "".join(
+                call.args[0] for call in mock_stdout.write.call_args_list
+                if call.args and isinstance(call.args[0], str)
+            )
+            self.assertIn("STATUS: ok", written)
+            self.assertIn("https://platform.example.com/v.mp4", written)
+
+    def test_status_no_wait_in_progress_no_url_passes(self):
+        """不 --wait 只查一次 → 中间态/无 URL 不当作错（正常状态查询）"""
+        from unittest import mock
+        def fake_curl(url, **kw):
+            return 200, '{"status":"in_progress","progress":30,"task_id":"task_x"}'
+        with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl), \
+             mock.patch("sys.stdout", new=mock.MagicMock()) as mock_stdout:
+            r = agnes_video.cmd_status(argparse.Namespace(
+                video_id=None, task_id="task_x",
+                wait=False, poll_interval=0.01, timeout=5, max_retries=1,
+                download=False, output=None, output_dir=None,
+                api_base="https://api", format="agent",
+            ))
+            # 中间态不算错，返回 0 + 看到当前状态
+            self.assertEqual(r, 0)
 
 
 class TestV32AgentOutputKeyField(unittest.TestCase):
