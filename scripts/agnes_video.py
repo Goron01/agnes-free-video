@@ -61,6 +61,12 @@ KEYFRAMES_MIN_IMAGES = 2
 # 一次请求最大图片数（API 兜底，避免发 8+ 张图被拒）
 MAX_IMAGES_PER_REQUEST = 8
 
+# v3.2.x: 客户端校验数值范围（官方 API 文档已写明，提前拒错省 API quota）
+FRAME_RATE_RANGE = (1, 60)  # 官方文档：「frame_rate 1-60」
+WIDTH_RANGE = (16, 4096)    # 官方文档无明确范围；留宽松边界（视频不会超过 4K）
+HEIGHT_RANGE = (16, 4096)
+NUM_INFERENCE_STEPS_RANGE = (1, 200)  # 行业常见上限，避免手滑传 99999
+
 # 视频文件默认输出目录（遵循 TOOLS.md 全局默认输出规则）
 DEFAULT_OUTPUT_DIR = "/home/goron/文档/Openclaw/输出/agnes-free-video"
 
@@ -385,6 +391,38 @@ def validate_num_frames(value: int) -> None:
         )
 
 
+def _validate_in_range(name: str, value: Optional[int], low: int, high: int) -> None:
+    """v3.2.x: 客户端校验数值范围，提前拒错避免浪费 API 配额"""
+    if value is None:
+        return
+    if not isinstance(value, (int, float)) or value != value:  # NaN 兜底
+        raise SystemExit(f"{name} must be a number, got: {value!r}")
+    if value < low or value > high:
+        raise SystemExit(
+            f"{name} must be in [{low}, {high}] (got {value}). "
+            f"See https://wiki.agnes-ai.com/llms.txt for spec."
+        )
+
+
+def validate_api_base(url: str) -> None:
+    """v3.2.x: --api-base URL 基础校验（避免 agent 写错路径只得到模糊 404）
+
+    不强求 host 完全等于官方域名（支持自部署代理 / 沙箱 mock），
+    只校验 scheme + 长得像 URL，避免拼错路径。
+    """
+    if not url or not url.strip():
+        raise SystemExit("--api-base cannot be empty")
+    parsed = parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SystemExit(
+            f"--api-base must start with http:// or https:// (got {url!r})"
+        )
+    if not parsed.netloc:
+        raise SystemExit(
+            f"--api-base missing host (got {url!r})"
+        )
+
+
 def validate_prompt(prompt: str) -> None:
     """P2-E: 客户端拒绝空 prompt，避免发空请求浪费 API 配额"""
     if not prompt or not prompt.strip():
@@ -415,6 +453,13 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     validate_num_frames(args.num_frames)
     validate_prompt(args.prompt)
     validate_mode_and_images(args)
+    # v3.2.x: 数值范围客户端校验（早 reject 省 API quota + agent 解析友好）
+    _validate_in_range("--height", args.height, *HEIGHT_RANGE)
+    _validate_in_range("--width", args.width, *WIDTH_RANGE)
+    _validate_in_range("--frame-rate", args.frame_rate, *FRAME_RATE_RANGE)
+    _validate_in_range(
+        "--num-inference-steps", args.num_inference_steps, *NUM_INFERENCE_STEPS_RANGE
+    )
     payload: dict[str, Any] = {
         "model": MODEL,
         "prompt": args.prompt,
@@ -816,6 +861,14 @@ def _final_response_size_seconds(response: dict[str, Any]) -> tuple[str, str]:
 
 
 def cmd_create(args: argparse.Namespace) -> int:
+    # v3.2.x: --api-base 早 reject（避免 agent 写错只得到模糊 404）
+    try:
+        validate_api_base(args.api_base)
+    except SystemExit as exc:
+        if args.format == "agent":
+            _print_agent_error(str(exc))
+            return 1
+        raise
     # v3.1 P0-B: --no-poll 跟 --download / --output 互斥（不轮询就拿不到 video_url）
     if args.no_poll and (args.download or args.output or args.output_dir):
         msg = (
@@ -1015,6 +1068,14 @@ def cmd_create(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    # v3.2.x: --api-base 早 reject
+    try:
+        validate_api_base(args.api_base)
+    except SystemExit as exc:
+        if args.format == "agent":
+            _print_agent_error(str(exc))
+            return 1
+        raise
     try:
         keys = get_api_keys()
     except ApiError as exc:
@@ -1226,12 +1287,19 @@ def main() -> int:
             _print_agent_error("Invalid CLI arguments (see usage above)")
             return 1
         raise
-    if args.command == "status" and not (args.video_id or args.task_id):
-        msg = "status requires --video-id or --task-id"
-        if getattr(args, "format", "agent") == "agent":
-            _print_agent_error(msg)
-            return 1
-        parser.error(msg)  # json / human 模式走 argparse 默认
+    if args.command == "status":
+        # v3.2.x: 空字符串 / 纯空白也算没传（避免 agent 写 "" 被发出去得模糊 404）
+        vid = (args.video_id or "").strip()
+        tid = (args.task_id or "").strip()
+        if not vid and not tid:
+            msg = "status requires --video-id or --task-id (non-empty)"
+            if getattr(args, "format", "agent") == "agent":
+                _print_agent_error(msg)
+                return 1
+            parser.error(msg)  # json / human 模式走 argparse 默认
+        # 标准化：把空字符串变 None，让 extract_* 走 fallback 路径
+        args.video_id = vid or None
+        args.task_id = tid or None
     return args.func(args)
 
 

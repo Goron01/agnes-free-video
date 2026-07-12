@@ -1,7 +1,13 @@
 ---
 name: agnes-free-video
-version: 3.2.1
+version: 3.2.2
 description: "Agnes-Video 文生视频/图生视频/关键帧。v3.2.0 起 4 key 粘性轮换（RPM=1 安全）。触发：文生视频、图生视频"
+emoji: 🎬
+primaryEnv: AGNES_API_KEY
+requires:
+  bins:
+    - python3
+    - curl
 ---
 
 # Agnes Free Video
@@ -99,6 +105,12 @@ python3 scripts/agnes_video.py status --video-id video_xxx --wait --download
 # task_id 也兼容（兜底）：
 python3 scripts/agnes_video.py status --task-id task_xxx --wait
 ```
+
+**为什么优先 video_id？** 官方文档明说「**新接入强烈推荐使用 `video_id`**」：
+- 创建任务响应同时返 `task_id` 和 `video_id`（官方文档明确两者不同）
+- video_id 走专用查询接口 `GET /agnesapi?video_id=...&model_name=agnes-video-v2.0`（官方文档推荐方式）
+- task_id 走旧接口 `GET /v1/videos/{task_id}`（兼容，可能后续下架）
+- 脚本默认先 video_id，404 才 fallback 到 task_id（v3.2.x 修复）。**agent 拿到的字段名也是 `VIDEO_ID` 更准**。
 
 ### 5. 提交后立即返回（批量场景）
 
@@ -216,13 +228,8 @@ python3 scripts/agnes_video.py create \
 - **API 详细字段/状态码/Prompt 模板**：[`references/api.md`](references/api.md)
 - **HTTP 客户端实现**：[`lib/http_client.py`](lib/http_client.py)（curl 子进程绕开沙箱卡死）
 
-> 📋 完整更新日志见 **[Changelog.md](Changelog.md)**。当前版本 v3.1.2，最近修复：
-> - **P0 安全增强**：`get_api_keys` 支持 XDG 全局路径 `~/.config/openclaw/agnes-free-video.env`（真 key 不被 skill 目录带走），向后兼容 skill .env + env var
-> - **P1-B 关键词误报修复**：`is_quota_error` 删「今天」「建议您」中文常用词（正常 API 响应误报 100%），改用强相关词组（quota/balance/credit + exhausted/exceeded/reached/insufficient）
-> - **P1-A setup.sh 验证步骤**：`HTTP_STATUS: 404` → `MESSAGE: task_not_exist (HTTP 400)`（同步 SKILL.md 实际行为）
-> - **P1-A setup.sh 多 key regex**：原 regex 只匹配单 key，多 key 一直被问是否覆盖，已修复
-> - **P1-C get_api_keys 统一 ApiError**：缺 key 时不再 raise SystemExit，改 raise ApiError 让 main() 统一输出 agent 格式错误
-> - **P1-D 重命名** `validate_image_count` → `validate_mode_and_images`（函数名反映实际校验逻辑：mode + image 数量）
-> - **P2-A VIDEO_URL_KEYS 注释**：明确 `remixed_from_video_id` 名字是 ID 但实际是 URL（官方文档字段名错乱）
-> - **P2-B _print_agent_submitted 加 PROMPT 字段**：agent 拿到 submitted 后还能看到原始 prompt
-> - **v3.2.0 KeyPool 粘性轮换**（突破 RPM=1 限制）：4 把 key 走 KeyPool（`lib/key_pool.py`），每任务粘一把 create + poll 全程用，4 把 key 顺序轮询。agent 输出新增 `KEY:` 字段。104 个测试全过（76 agnes_video + 28 key_pool）
+> 📋 完整更新日志见 **[Changelog.md](Changelog.md)**。当前版本 v3.2.2，最近修复：
+> - **v3.2.2 客户端数值/URL 范围校验**：`--frame-rate` (1-60) / `--width` `--height` (16-4096) / `--num-inference-steps` (1-200) / `--api-base` (http/https + host) 早 reject，不浪费 API quota + agent 解析友好
+> - **v3.2.2 status 空 ID 拒绝**：`--video-id ""` / `--task-id "   "` 直接报 `requires --video-id or --task-id (non-empty)`，不再发出去得模糊 404
+> - **v3.2.1 agent 视角 4 P0 + 1 P1 修复**：metadata.url 深嵌套 / wait+completed+无URL 不静默 / setup.sh cwd 错位 / extract_video_id 放宽 / 429 mark_used 进 cooldown
+> - **v3.2.0 KeyPool 粘性轮换**（突破 RPM=1 限制）：4 把 key 走 KeyPool（`lib/key_pool.py`），每任务粘一把 create + poll 全程用，4 把 key 顺序轮询。agent 输出新增 `KEY:` 字段。131 个测试全过

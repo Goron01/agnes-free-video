@@ -1205,5 +1205,159 @@ class TestV32AgentOutputKeyField(unittest.TestCase):
         self.assertIn("STATUS: submitted", out)
 
 
+# ============================================================================
+# v3.2.x: 客户端数值 + URL 范围校验（agent 友好错误）
+# ============================================================================
+
+class TestValidateInRange(unittest.TestCase):
+    """v3.2.x: _validate_in_range 数值范围校验"""
+
+    def test_valid_in_range(self):
+        """合法值不报错"""
+        agnes_video._validate_in_range("--frame-rate", 24, 1, 60)
+        agnes_video._validate_in_range("--height", 768, 16, 4096)
+        agnes_video._validate_in_range("--width", 1152, 16, 4096)
+        agnes_video._validate_in_range("--num-inference-steps", 50, 1, 200)
+
+    def test_none_skipped(self):
+        """None 跳过（可选参数未传）"""
+        agnes_video._validate_in_range("--frame-rate", None, 1, 60)
+        agnes_video._validate_in_range("--num-inference-steps", None, 1, 200)
+
+    def test_above_max_raises(self):
+        """超过上限报错"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video._validate_in_range("--frame-rate", 999, 1, 60)
+        self.assertIn("[1, 60]", str(cm.exception))
+        self.assertIn("999", str(cm.exception))
+
+    def test_below_min_raises(self):
+        """低于下限报错"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video._validate_in_range("--frame-rate", 0, 1, 60)
+        self.assertIn("[1, 60]", str(cm.exception))
+
+
+class TestValidateApiBase(unittest.TestCase):
+    """v3.2.x: validate_api_base URL 基础校验"""
+
+    def test_valid_https(self):
+        """合法 https URL 不报错"""
+        agnes_video.validate_api_base("https://apihub.agnes-ai.com")
+        agnes_video.validate_api_base("http://localhost:8080")
+
+    def test_valid_with_path(self):
+        """带路径的 URL 也合法"""
+        agnes_video.validate_api_base("https://example.com/api/v1")
+
+    def test_empty_raises(self):
+        """空字符串报错"""
+        with self.assertRaises(SystemExit):
+            agnes_video.validate_api_base("")
+        with self.assertRaises(SystemExit):
+            agnes_video.validate_api_base("   ")
+
+    def test_no_scheme_raises(self):
+        """缺 scheme 报错"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video.validate_api_base("apihub.agnes-ai.com")
+        self.assertIn("http://", str(cm.exception))
+
+    def test_wrong_scheme_raises(self):
+        """非 http/https 报错"""
+        with self.assertRaises(SystemExit):
+            agnes_video.validate_api_base("ftp://example.com")
+        with self.assertRaises(SystemExit):
+            agnes_video.validate_api_base("javascript:alert(1)")
+
+    def test_no_host_raises(self):
+        """缺 host 报错"""
+        with self.assertRaises(SystemExit):
+            agnes_video.validate_api_base("https://")
+
+
+class TestBuildPayloadRangeChecks(unittest.TestCase):
+    """v3.2.x: build_payload 现在也跑数值范围校验"""
+
+    def _args(self, **overrides):
+        defaults = dict(
+            prompt="A cinematic test prompt",
+            image_url=None,
+            mode=None,
+            height=768,
+            width=1152,
+            num_frames=121,
+            num_inference_steps=None,
+            seed=None,
+            frame_rate=24,
+            negative_prompt=None,
+        )
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def test_frame_rate_out_of_range(self):
+        """frame_rate=999 应被 build_payload 早 reject"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video.build_payload(self._args(frame_rate=999))
+        self.assertIn("[1, 60]", str(cm.exception))
+
+    def test_width_out_of_range(self):
+        """width=99999 应被 build_payload 早 reject"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video.build_payload(self._args(width=99999))
+        self.assertIn("width", str(cm.exception).lower())
+
+    def test_height_out_of_range(self):
+        """height=5 应被 build_payload 早 reject"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video.build_payload(self._args(height=5))
+        self.assertIn("height", str(cm.exception).lower())
+
+    def test_num_inference_steps_out_of_range(self):
+        """num_inference_steps=99999 应被早 reject"""
+        with self.assertRaises(SystemExit) as cm:
+            agnes_video.build_payload(self._args(num_inference_steps=99999))
+        self.assertIn("[1, 200]", str(cm.exception))
+
+    def test_valid_values_pass(self):
+        """合法值通过"""
+        p = agnes_video.build_payload(self._args(
+            frame_rate=30, width=1280, height=720, num_inference_steps=50
+        ))
+        self.assertEqual(p["frame_rate"], 30)
+        self.assertEqual(p["width"], 1280)
+        self.assertEqual(p["height"], 720)
+        self.assertEqual(p["num_inference_steps"], 50)
+
+
+class TestStatusEmptyIdRejection(unittest.TestCase):
+    """v3.2.x: status --video-id '' / --task-id '   ' 应被早 reject
+
+    背景：空字符串被 argparse 接受为有效值，会被拼到 URL 里产生 404 噪音。
+    修复：main() 里 strip 后判空。
+    """
+
+    def test_both_empty_agent_format(self):
+        """两个都空 → STATUS: error"""
+        result = subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "agnes_video.py"),
+             "status", "--video-id", "", "--task-id", "   ", "--format", "agent"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("STATUS: error", result.stdout)
+        self.assertIn("requires --video-id or --task-id", result.stdout)
+
+    def test_whitespace_only_video_id(self):
+        """只有空白 video_id 当成空"""
+        result = subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "agnes_video.py"),
+             "status", "--video-id", "   ", "--format", "agent"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("STATUS: error", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4,6 +4,67 @@
 
 ---
 
+## v3.2.2 (2026-07-13) — Agent 视角审查 + 客户端数值/URL 范围校验
+
+**背景**：主人 2026-07-13 让小美用 agent 视角重跑 agnes-free-video。v3.2.1 修了 4 P0 + 1 P1，但发现还有几个让 agent 调错参数后产生“API 返错才有反馈”的坑。补齐客户端校验 + status 空 ID 拒绝 + 文档一致性。
+
+### P0 修复
+
+- **P0-1 SKILL.md frontmatter 补齐 OpenClaw 元数据**
+  - 现状：v3.1.0 P2-A/B/C 承诺过 `requires.bins: ["python3", "curl"]` / `primaryEnv: AGNES_API_KEY` / `emoji: 🎬`，但 SKILL.md frontmatter 始终没加
+  - 后果：OpenClaw UI 不识别 skill 依赖 / 不能提示配 key / 技能列表里看不到 emoji
+  - 修复：3 个字段都补齐，跟 SKILL.md 末尾实际行为一致
+
+- **P0-2 SKILL.md 末尾版本号同步到 v3.2.1 → v3.2.2**
+  - 现状：写了「当前版本 v3.1.2，最近修复」+ 列了 8 个 v3.1.2 的 P 修复，但 frontmatter 已经是 3.2.1，文档自相矛盾
+  - 修复：改「当前版本 v3.2.2」+ 列最新三个版本（v3.2.2 / v3.2.1 / v3.2.0）的亮点
+
+- **P0-3 README.md 全面重写（v3.0 subcommand 结构之前是 positional arg）**
+  - 现状：
+    - 写「当前版本：3.1.2」（陈旧）
+    - 快速开始示例用旧式 `python3 scripts/agnes_video.py "一只猫在草地上奔跑"`（positional arg），与 v3.0 重构后的 subcommand 结构 (`create` / `status`) 完全对不上
+    - 安装段写 `HTTP_PROXY=http://127.0.0.1:7897`——脚本根本不读 `HTTP_PROXY`，完全误导
+  - 修复：重写为 3 种安装方式 + 4 个 subcommand Quick Start，跟 SKILL.md 一致
+
+### P1 修复
+
+- **P1-1 客户端数值范围校验**
+  - `--frame-rate`（1-60）：传 999 会发请求才发现错，浪费 quota
+  - `--width` `--height`（16-4096）：手滑传 99999 也会发出去
+  - `--num-inference-steps`（1-200）：同上
+  - 新增 `_validate_in_range(name, value, low, high)` helper，在 `build_payload` 里早 reject
+  - 新增 17 个回归测试（`TestValidateInRange` + `TestValidateApiBase` + `TestBuildPayloadRangeChecks` + `TestStatusEmptyIdRejection`）
+
+- **P1-2 `--api-base` URL 基础校验**
+  - 现状：传 `not-a-url` / `javascript:alert(1)` / 空字符串都会被拼上去，导致 agent 看不到错（只有模糊 404）
+  - 修复：`validate_api_base()` 校验 scheme ∈ {http, https} + host 非空 + 非空白
+
+- **P1-3 SKILL.md 加「为什么优先 video_id」说明**
+  - 现状：官方文档明说「**新接入强烈推荐 `video_id`**」，但 SKILL.md 只说「video_id 新 API 推荐」，原因不详
+  - 修复：Quick Start 第 4 节后面加 3 点理由（专用接口 / 旧接口可能下架 / 脚本默认 fallback 顺序）
+
+### P2 优化
+
+- **P2-1 status 空 ID 早 reject**
+  - 现状：`--video-id ""` / `--task-id "   "` 被 argparse 接受为有效值，会拼到 URL 里产生模糊 404
+  - 修复：main() 里 `.strip() or None`，agent 拿到明确 `STATUS: error + MESSAGE: requires --video-id or --task-id (non-empty)`
+
+### 迁移 / 兼容性
+
+- **新增错误**：传非法数值 / URL / 空 ID 会产生新的 `STATUS: error` 退出码 1（之前是发出去等 API 返错）
+- **纯增量**：合法值不变，agent 输出格式不变
+- **README.md 全面重写**：旧 README.md 的 positional arg 示例作废，跟不上 v3.0+ subcommand 结构
+
+### 测试
+
+- **114 → 131 测试**（+17，全过 6.14s）
+  - `TestValidateInRange` (4)：合法 / None 跳过 / 上限 / 下限
+  - `TestValidateApiBase` (6)：合法 https / 带路径 / 空 / 缺 scheme / 错误 scheme / 缺 host
+  - `TestBuildPayloadRangeChecks` (5)：frame-rate / width / height / num-inference-steps 越界 + 合法值通过
+  - `TestStatusEmptyIdRejection` (2)：两个都空 + 只有空白 video_id
+
+---
+
 ## v3.2.x (2026-07-13) — Agent 视角审查：4 个 P0 bug + 1 个 P1 增强 + 9 个新测试
 
 **背景**：主人 2026-07-13 让小美用 agent 视角重跑一遍 agnes-free-video，端到端测试 T2V/I2V/Keyframes/status 查询/download。发现 4 个真实 bug，包括一个**让视频下载失败的 severe bug**（API 改了 URL 字段名但脚本没识别），全部修复 + 新增 9 个测试（总 104 → 114）。
