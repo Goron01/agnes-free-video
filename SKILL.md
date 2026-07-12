@@ -1,7 +1,7 @@
 ---
 name: agnes-free-video
-version: 3.1.2
-description: "Agnes-Video 文生视频/图生视频/关键帧。触发：文生视频、图生视频"
+version: 3.2.0
+description: "Agnes-Video 文生视频/图生视频/关键帧。v3.2.0 起 4 key 粘性轮换（RPM=1 安全）。触发：文生视频、图生视频"
 ---
 
 # Agnes Free Video
@@ -225,3 +225,4 @@ python3 scripts/agnes_video.py create \
 > - **P1-D 重命名** `validate_image_count` → `validate_mode_and_images`（函数名反映实际校验逻辑：mode + image 数量）
 > - **P2-A VIDEO_URL_KEYS 注释**：明确 `remixed_from_video_id` 名字是 ID 但实际是 URL（官方文档字段名错乱）
 > - **P2-B _print_agent_submitted 加 PROMPT 字段**：agent 拿到 submitted 后还能看到原始 prompt
+> - **v3.2.0 KeyPool 粘性轮换**（突破 RPM=1 限制）：4 把 key 走 KeyPool（`lib/key_pool.py`），每任务粘一把 create + poll 全程用，4 把 key 顺序轮询。agent 输出新增 `KEY:` 字段。104 个测试全过（76 agnes_video + 28 key_pool）

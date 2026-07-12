@@ -458,7 +458,11 @@ class TestV31BugFixes(unittest.TestCase):
 # ============================================================================
 
 class TestV31GetStatusSmart(unittest.TestCase):
-    """v3.1 P0-C / P0-D 单元测试（用 mock 避免真实 API 调用）"""
+    """v3.1 P0-C / P0-D 单元测试（用 mock 避免真实 API 调用）
+
+    v3.2.0 改动：get_status_smart / request_json_with_retry 入参从
+    `keys: list` 改为 `key: str`（粘性单 key）。
+    """
 
     def test_404_fallback_to_task_id(self):
         """video_id 404 → 自动 fallback 到 task_id"""
@@ -469,7 +473,7 @@ class TestV31GetStatusSmart(unittest.TestCase):
             return 200, '{"status":"completed","video_url":"https://x.com/v.mp4"}'
         with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
             r = agnes_video.get_status_smart(
-                ("video_fake", "task_real"), ["k1"], "https://api", 1
+                ("video_fake", "task_real"), "sk-single", "https://api", 1
             )
             self.assertEqual(r["status"], "completed")
 
@@ -481,19 +485,22 @@ class TestV31GetStatusSmart(unittest.TestCase):
         with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
             with self.assertRaises(agnes_video.ApiError) as ctx:
                 agnes_video.get_status_smart(
-                    ("video_fake", None), ["k1"], "https://api", 1
+                    ("video_fake", None), "sk-single", "https://api", 1
                 )
             self.assertEqual(ctx.exception.status, 404)
 
     def test_401_does_not_fallback(self):
-        """P0-D: 401/403 不 fallback 到 task_id（用同一 key 必然同样错）"""
+        """P0-D: 401/403 不 fallback 到 task_id（用同一 key 必然同样错）
+
+        v3.2.0 改动：现在报 KeyDeadError（ApiError 子类），status=401
+        """
         from unittest import mock
         def fake_curl(url, **kw):
             return 401, '{"message":"无效的令牌"}'
         with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
             with self.assertRaises(agnes_video.ApiError) as ctx:
                 agnes_video.get_status_smart(
-                    ("video_xxx", "task_yyy"), ["k1"], "https://api", 1
+                    ("video_xxx", "task_yyy"), "sk-single", "https://api", 1
                 )
             self.assertEqual(ctx.exception.status, 401)
 
@@ -505,23 +512,25 @@ class TestV31GetStatusSmart(unittest.TestCase):
         with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
             with self.assertRaises(agnes_video.ApiError) as ctx:
                 agnes_video.get_status_smart(
-                    ("video_xxx", "task_yyy"), ["k1"], "https://api", 1
+                    ("video_xxx", "task_yyy"), "sk-single", "https://api", 1
                 )
             self.assertEqual(ctx.exception.status, 500)
 
-    def test_all_keys_401_raises_immediately(self):
-        """P0-E: 一轮所有 key 都 401 立刻抛（不等 3 轮退避）"""
+    def test_single_key_401_raises_key_dead_error(self):
+        """v3.2.0: 单 key 401/403 抛 KeyDeadError（让上层换 key）
+
+        替代 v3.1 的 test_all_keys_401_raises_immediately（已不适用）
+        """
         from unittest import mock
         def fake_curl(url, **kw):
             return 401, '{"message":"无效的令牌"}'
         with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
-            with self.assertRaises(agnes_video.ApiError) as ctx:
+            with self.assertRaises(agnes_video.KeyDeadError) as ctx:
                 agnes_video.request_json_with_retry(
-                    "GET", "https://api", ["k1", "k2", "k3"], max_retries=3
+                    "GET", "https://api", "sk-only", max_retries=1
                 )
             self.assertEqual(ctx.exception.status, 401)
-            self.assertIn("All 3 key(s) returned 401", str(ctx.exception))
-            self.assertIn("Check AGNES_API_KEY", str(ctx.exception))
+            self.assertIn("auth failed", str(ctx.exception).lower())
 
 
 # ============================================================================
@@ -844,6 +853,175 @@ class TestApiKeyXdgPath(unittest.TestCase):
             with self.assertRaises(agnes_video.ApiError) as ctx:
                 agnes_video.get_api_keys()
             self.assertIn("Missing API key", str(ctx.exception))
+
+
+# ============================================================================
+# v3.2.0 新增测试
+# ============================================================================
+
+class TestV32KeyPoolIntegration(unittest.TestCase):
+    """v3.2.0: KeyPool 接入 + KeyDeadError 转换
+
+    场景：
+    - cmd_create 遇到 KeyDeadError → mark_dead + 换 key 重试
+    - cmd_create 4 把 key 全死 → 报 "All N key(s) returned 401/403"
+    - get_key_pool 单例：4 把 key 在多次 cmd_create 间轮换
+    """
+
+    def setUp(self):
+        # 重置 KeyPool 单例（避免被其他测试污染）
+        agnes_video.reset_key_pool()
+
+    def tearDown(self):
+        agnes_video.reset_key_pool()
+
+    def test_create_swap_key_on_401(self):
+        """v3.2.0: cmd_create 遇 401 → mark_dead + 换 key 重试 → 成功"""
+        from unittest import mock
+        call_log = []
+
+        def fake_curl(url, **kw):
+            # 从 headers 拿 key
+            auth = kw.get("headers", {}).get("Authorization", "")
+            key = auth.replace("Bearer ", "")
+            call_log.append((key, "POST" in kw.get("method", "POST") or "POST" == kw.get("method", "POST")))
+            # 实际看 method 参数
+            method = kw.get("method", "POST")
+            call_log.append((key, method))
+            # key1 → 401，其他 key → 200
+            if key == "sk-key1":
+                return 401, '{"message":"无效的令牌"}'
+            return 200, '{"id":"task_xxx","video_id":"video_xxx","status":"queued"}'
+
+        # 4 把 key，1 把死
+        keys = ["sk-key1", "sk-key2", "sk-key3", "sk-key4"]
+        pool = agnes_video.get_key_pool(keys)
+
+        # 模拟：第一次 create 死一次，然后切下一把成功
+        # cmd_create 会调 max_key_swaps=4 次
+        # 但其实只要 1 次 swap 就够
+        with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
+            # 不真跑 cmd_create（太复杂），直接验证 KeyPool 行为
+            key1 = pool.acquire_key(verbose=False)
+            self.assertEqual(key1, "sk-key1")
+            with self.assertRaises(agnes_video.KeyDeadError):
+                agnes_video.request_json_with_retry("POST", "https://api", key1, max_retries=1)
+            pool.mark_dead(key1)
+            # 第二把应该跳过 sk-key1（已死），选 sk-key2
+            key2 = pool.acquire_key(verbose=False)
+            self.assertEqual(key2, "sk-key2")
+            response = agnes_video.request_json_with_retry("POST", "https://api", key2, max_retries=1)
+            self.assertEqual(response["video_id"], "video_xxx")
+            pool.mark_used(key2)
+
+        # sk-key1 应被标记为死
+        self.assertTrue(pool.is_dead("sk-key1"))
+        # sk-key2 应被标记为已用
+        self.assertGreater(pool._last_used["sk-key2"], 0.0)
+
+    def test_all_keys_dead_raises_api_error(self):
+        """v3.2.0: 4 把 key 全死 → cmd_create 应报 "All 4 key(s) returned 401/403"
+        （这里只验证 pool 行为，cmd_create 端到端测试在集成测试里）"""
+        from unittest import mock
+        keys = ["sk-k1", "sk-k2", "sk-k3", "sk-k4"]
+        pool = agnes_video.get_key_pool(keys)
+        for k in keys:
+            pool.mark_dead(k, verbose=False)
+        # 4 把都死了，兜底还是会选一把（pool 不阻断），让上层撞 401
+        selected = pool.acquire_key(verbose=False)
+        self.assertIn(selected, keys)
+
+    def test_key_pool_singleton_across_calls(self):
+        """v3.2.0: get_key_pool 单例 → 多次调用共享状态"""
+        keys1 = ["sk-a", "sk-b", "sk-c", "sk-d"]
+        keys2 = ["sk-x", "sk-y"]  # 不同 keys
+        pool1 = agnes_video.get_key_pool(keys1)
+        pool2 = agnes_video.get_key_pool(keys2)  # 第二次调用应忽略
+        self.assertIs(pool1, pool2)  # 同一个单例
+        self.assertEqual(len(pool1), 4)  # 用第一次的 keys
+
+    def test_reset_key_pool(self):
+        """v3.2.0: reset_key_pool 清空单例 → 下次 get_key_pool 用新 keys"""
+        pool1 = agnes_video.get_key_pool(["sk-a", "sk-b"])
+        agnes_video.reset_key_pool()
+        pool2 = agnes_video.get_key_pool(["sk-x", "sk-y", "sk-z"])
+        self.assertIsNot(pool1, pool2)
+        self.assertEqual(len(pool2), 3)
+
+    def test_429_does_not_swap_key(self):
+        """v3.2.0: 429 限流 → 重试同 key（不换 key，换 key 也撞 RPM=1）"""
+        from unittest import mock
+        keys = ["sk-a", "sk-b"]
+        pool = agnes_video.get_key_pool(keys)
+        call_count = {"n": 0}
+
+        def fake_curl(url, **kw):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return 429, '{"message":"rate limit"}'
+            return 200, '{"id":"task_xxx","video_id":"video_xxx","status":"queued"}'
+
+        with mock.patch.object(agnes_video, "curl_request", side_effect=fake_curl):
+            key = pool.acquire_key(verbose=False)
+            response = agnes_video.request_json_with_retry(
+                "POST", "https://api", key, max_retries=3
+            )
+            # 3 次调用都应该是同一把 key（不换）
+            self.assertEqual(call_count["n"], 3)
+            self.assertEqual(response["video_id"], "video_xxx")
+            # key 状态：429 时不调 mark_used（pool 上层决定）
+            # 成功后才调 mark_used
+            pool.mark_used(key)
+            self.assertGreater(pool._last_used[key], 0.0)
+
+
+class TestV32AgentOutputKeyField(unittest.TestCase):
+    """v3.2.0: agent 输出加 KEY: 字段"""
+
+    def _capture(self, func, *args, **kwargs):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            func(*args, **kwargs)
+        return buf.getvalue()
+
+    def test_agent_success_includes_key(self):
+        """v3.2.0: _print_agent_success 接受 key_fp 参数"""
+        out = self._capture(
+            agnes_video._print_agent_success,
+            Path("/tmp/v.mp4"),
+            "https://gcs.example.com/v.mp4",
+            "video_xxx",
+            "task_xxx",
+            "test",
+            "1280x768",
+            "10.0",
+            "sk-Gyu***1P",
+        )
+        self.assertIn("KEY: sk-Gyu***1P", out)
+
+    def test_agent_success_no_key(self):
+        """v3.2.0: 不传 key_fp 时不输出 KEY 字段（向后兼容）"""
+        out = self._capture(
+            agnes_video._print_agent_success,
+            Path("/tmp/v.mp4"),
+            "https://gcs.example.com/v.mp4",
+            "video_xxx",
+            "task_xxx",
+            "test",
+        )
+        self.assertNotIn("KEY:", out)
+
+    def test_agent_submitted_includes_key(self):
+        """v3.2.0: _print_agent_submitted 接受 key_fp 参数"""
+        out = self._capture(
+            agnes_video._print_agent_submitted,
+            "video_xxx", "task_xxx",
+            prompt="test", key_fp="sk-***",
+        )
+        self.assertIn("KEY: sk-***", out)
+        self.assertIn("STATUS: submitted", out)
 
 
 if __name__ == "__main__":

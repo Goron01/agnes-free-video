@@ -32,6 +32,8 @@ from urllib import parse
 # v3.0: 共享 curl 客户端（绕开 urllib 沙箱卡死）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from http_client import curl_request, download_file  # noqa: E402
+# v3.2.0: Key 池（粘性 + 冷却轮换，绕开 RPM=1 限制）
+from key_pool import KeyPool, _key_fingerprint, DEFAULT_COOLDOWN_SEC  # noqa: E402
 
 
 API_BASE = os.environ.get("AGNES_API_BASE", "https://apihub.agnes-ai.com").rstrip("/")
@@ -86,6 +88,36 @@ class ApiError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.payload = payload
+
+
+class KeyDeadError(ApiError):
+    """v3.2.0: 401/403 鉴权失败 → 上层应该换 key（pool.mark_dead + 重新 acquire）"""
+    pass
+
+
+# v3.2.0: KeyPool 单例（cmd_create / cmd_status 共用，让 polling 跟 create 用同一把 key）
+# 单进程内 4 把 key 跨 create 任务均匀轮换
+_KEY_POOL: Optional[KeyPool] = None
+
+
+def get_key_pool(keys: list[str]) -> KeyPool:
+    """获取（或懒初始化）KeyPool 单例
+
+    v3.2.0 设计：
+    - 单进程内一个 pool，所有 create/status 共享状态
+    - 第一次调用时根据 keys 列表建 pool，后续调用忽略（keys 一致）
+    - 这样跨 cmd_create 多次调用，4 把 key 真正轮换均匀
+    """
+    global _KEY_POOL
+    if _KEY_POOL is None:
+        _KEY_POOL = KeyPool(keys=keys)
+    return _KEY_POOL
+
+
+def reset_key_pool() -> None:
+    """测试用：清空 pool 单例"""
+    global _KEY_POOL
+    _KEY_POOL = None
 
 
 def get_api_keys() -> list[str]:
@@ -217,22 +249,38 @@ def _extract_err_msg(payload: Any) -> Optional[str]:
 def request_json_with_retry(
     method: str,
     url: str,
-    keys: list,
+    key: str,
     payload: Optional[dict] = None,
     max_retries: int = MAX_RETRIES,
     timeout: int = 180,
 ) -> dict:
-    """带指数退避重试 + Key 轮换的 HTTP 请求
+    """v3.2.0: 单 key 重试（粘性）+ 鉴权失败抛 KeyDeadError 让上层换 key
 
-    策略（参考 agnes-free-image v2.0）：
-    - 每轮重试：依次尝试所有 key（遇到可重试错误就切下一个）
-    - 一轮 key 都用完后做指数退避（1.5s, 3s, 6s）
-    - 429/配额错误额外等更久
-    - 4xx 业务错误（除 429）立刻抛 ApiError，不重试
+    策略变更（对比 v3.1）：
+    - **入参从 `keys: list` 改成 `key: str`**：本请求全程只用这一把 key
+    - 5xx/429/网络错误：指数退避（1.5s, 3s, 6s），还在同一把 key 上重试
+    - 401/403 auth 错（**配额类** is_quota_error=True）：抛 KeyDeadError
+      → 上层 pool.mark_dead(key) + 重新 acquire_key() 换下一把
+    - 401/403 非配额（真鉴权错）：也抛 KeyDeadError（同样换 key）
+    - 4xx 业务错误（400/404/422...）：直接抛 ApiError，不重试不换 key
+    - 429 限流：**不换 key**（换 key 也撞 RPM=1），靠退避等到冷却完
 
-    v3.1 行为：
-    - P0-E：所有 key 在第一轮都返回 401/403 时，本轮立刻抛错（不再等 3 轮退避）
-    - 其他可重试错误（5xx/429/网络）仍走完整退避
+    退避重试轮数（max_retries 默认 3）：
+    - 5xx/429/网络：1.5s → 3s → 6s 退避
+    - 429 额外 +10s（v3.0 沿用）
+
+    与 KeyPool 配合（典型用法）：
+        pool = get_key_pool(keys)
+        for _ in range(3):  # 最多换 3 把 key
+            try:
+                key = pool.acquire_key()
+                response = request_json_with_retry(method, url, key)
+                pool.mark_used(key)
+                return response
+            except KeyDeadError:
+                pool.mark_dead(key)
+                continue
+        raise ApiError("All keys returned 401/403 after 3 retries")
     """
     data_str: Optional[str] = None
     headers = {"Content-Type": "application/json"}
@@ -240,94 +288,84 @@ def request_json_with_retry(
         data_str = json.dumps(payload, ensure_ascii=False)
 
     last_error: Optional[ApiError] = None
+    key_fp = _key_fingerprint(key)
 
     for attempt in range(max_retries):
-        round_had_auth_error = False  # 本轮是否所有 key 都 auth 失败
-        for key_index, key in enumerate(keys):
-            headers["Authorization"] = f"Bearer {key}"
-            try:
-                code, body = curl_request(
-                    url=url,
-                    method=method,
-                    headers=headers,
-                    data=data_str,
-                    timeout=timeout,
-                )
-            except Exception as e:
-                last_error = ApiError(f"Network error: {e}")
-                continue  # 切下一个 key
-
-            # 成功
-            if 200 <= code < 300:
-                parsed = _try_parse_json(body)
-                if parsed is None:
-                    raise ApiError(f"Expected JSON object, got: {body[:300]}")
-                if not isinstance(parsed, dict):
-                    raise ApiError(f"Expected JSON object, got: {body[:300]}")
-                if parsed.get("error"):
-                    raise ApiError(
-                        _extract_err_msg(parsed) or "API returned an error",
-                        payload=parsed,
-                    )
-                return parsed
-
-            # 业务错误（4xx，非 429）
-            if 400 <= code < 500 and code not in RETRYABLE_STATUS:
-                if code in (401, 403) and is_quota_error(body, code):
-                    raise ApiError(
-                        f"Agnes API quota exhausted (HTTP {code}): {body[:200]}",
-                        status=code,
-                    )
-                if code in (401, 403):
-                    last_error = ApiError(
-                        f"Auth failed (HTTP {code}): {body[:200]}",
-                        status=code,
-                    )
-                    print(
-                        f"# [retry] attempt {attempt + 1}/{max_retries} key {key_index + 1}/{len(keys)} "
-                        f"got auth error (status={code}), trying next key...",
-                        file=sys.stderr,
-                    )
-                    round_had_auth_error = True
-                    continue
-                # 其他 4xx 业务错误：直接报错，不重试
-                parsed = _try_parse_json(body)
-                msg = _extract_err_msg(parsed) if isinstance(parsed, dict) else None
-                raise ApiError(
-                    msg or f"HTTP {code}: {body[:200]}",
-                    status=code,
-                    payload=parsed,
-                )
-
-            # 可重试错误（5xx / 429 / 网络）
-            last_error = ApiError(
-                f"HTTP {code}: {body[:200]}" if body else f"Network error (http_code={code})",
-                status=code,
+        headers["Authorization"] = f"Bearer {key}"
+        try:
+            code, body = curl_request(
+                url=url,
+                method=method,
+                headers=headers,
+                data=data_str,
+                timeout=timeout,
             )
-            retry_kind = "quota" if (code == 429 or is_quota_error(body, code)) else "transient"
+        except Exception as e:
+            last_error = ApiError(f"Network error: {e}")
             print(
-                f"# [retry] attempt {attempt + 1}/{max_retries} key {key_index + 1}/{len(keys)} "
-                f"got {retry_kind} error (status={code}), trying next...",
+                f"# [retry] {key_fp} attempt {attempt + 1}/{max_retries} "
+                f"network error: {e}, retrying same key...",
                 file=sys.stderr,
             )
-            # 切下一个 key
+            # 网络错误不换 key，退避后重试
+            if attempt < max_retries - 1:
+                time.sleep(BASE_BACKOFF_SEC * (2 ** attempt))
+            continue
 
-        # 一轮 key 都试过：指数退避（但 v3.1: 本轮全 auth 失败 → 立刻抛，不等退避）
-        if round_had_auth_error and last_error and last_error.status in (401, 403):
+        # 成功
+        if 200 <= code < 300:
+            parsed = _try_parse_json(body)
+            if parsed is None:
+                raise ApiError(f"Expected JSON object, got: {body[:300]}")
+            if not isinstance(parsed, dict):
+                raise ApiError(f"Expected JSON object, got: {body[:300]}")
+            if parsed.get("error"):
+                raise ApiError(
+                    _extract_err_msg(parsed) or "API returned an error",
+                    payload=parsed,
+                )
+            return parsed
+
+        # 业务错误（4xx，非 429）
+        if 400 <= code < 500 and code not in RETRYABLE_STATUS:
+            if code in (401, 403):
+                # 鉴权 / 配额失败 → 抛 KeyDeadError 让上层换 key
+                quota = is_quota_error(body, code)
+                kind = "quota" if quota else "auth"
+                print(
+                    f"# [retry] {key_fp} attempt {attempt + 1}/{max_retries} "
+                    f"got {kind} error (status={code}), signal to swap key",
+                    file=sys.stderr,
+                )
+                raise KeyDeadError(
+                    f"Agnes API {kind} failed with {key_fp} (HTTP {code}): {body[:200]}",
+                    status=code,
+                )
+            # 其他 4xx 业务错误：直接报错，不重试不换 key
+            parsed = _try_parse_json(body)
+            msg = _extract_err_msg(parsed) if isinstance(parsed, dict) else None
             raise ApiError(
-                f"All {len(keys)} key(s) returned {last_error.status} "
-                f"(auth/quota issue). Check AGNES_API_KEY.\n"
-                f"  Last error: {last_error}",
-                status=last_error.status,
+                msg or f"HTTP {code}: {body[:200]}",
+                status=code,
+                payload=parsed,
             )
+
+        # 可重试错误（5xx / 429 / 网络 code=0）
+        last_error = ApiError(
+            f"HTTP {code}: {body[:200]}" if body else f"Network error (http_code={code})",
+            status=code,
+        )
+        retry_kind = "quota" if (code == 429 or is_quota_error(body, code)) else "transient"
+        print(
+            f"# [retry] {key_fp} attempt {attempt + 1}/{max_retries} "
+            f"got {retry_kind} error (status={code}), retrying same key (don't swap - "
+            f"next key also has RPM=1 cooldown)",
+            file=sys.stderr,
+        )
         if attempt < max_retries - 1:
             wait = BASE_BACKOFF_SEC * (2 ** attempt)
             if last_error and is_quota_error(str(last_error), last_error.status):
                 wait = max(wait, QUOTA_BACKOFF_SEC)
-            print(
-                f"# [retry] all keys exhausted, sleeping {wait:.1f}s before next round",
-                file=sys.stderr,
-            )
             time.sleep(wait)
 
     raise last_error or ApiError("All retries exhausted")
@@ -489,32 +527,32 @@ def extract_video_url(response: dict[str, Any]) -> Optional[str]:
 # v3.0: HTTP 调用封装（POST + GET video_id + GET task_id 兜底）
 # ============================================================================
 
-def create_task(args: argparse.Namespace, keys: list[str]) -> dict[str, Any]:
-    """POST 创建任务"""
+def create_task(args: argparse.Namespace, key: str) -> dict[str, Any]:
+    """POST 创建任务（v3.2.0: 单 key，粘性）"""
     url = f"{args.api_base.rstrip('/')}/v1/videos"
-    return request_json_with_retry("POST", url, keys, args.payload, max_retries=args.max_retries)
+    return request_json_with_retry("POST", url, key, args.payload, max_retries=args.max_retries)
 
 
-def get_status_by_video_id(video_id: str, keys: list[str], api_base: str, max_retries: int) -> dict[str, Any]:
+def get_status_by_video_id(video_id: str, key: str, api_base: str, max_retries: int) -> dict[str, Any]:
     """新 API 推荐方式：GET /agnesapi?video_id=...（含可选 model_name）"""
     url = f"{api_base.rstrip('/')}/agnesapi?video_id={parse.quote(video_id)}&model_name={MODEL}"
-    return request_json_with_retry("GET", url, keys, max_retries=max_retries)
+    return request_json_with_retry("GET", url, key, max_retries=max_retries)
 
 
-def get_status_by_task_id(task_id: str, keys: list[str], api_base: str, max_retries: int) -> dict[str, Any]:
+def get_status_by_task_id(task_id: str, key: str, api_base: str, max_retries: int) -> dict[str, Any]:
     """兼容方式：GET /v1/videos/{task_id}"""
     url = f"{api_base.rstrip('/')}/v1/videos/{parse.quote(task_id)}"
-    return request_json_with_retry("GET", url, keys, max_retries=max_retries)
+    return request_json_with_retry("GET", url, key, max_retries=max_retries)
 
 
 def get_status_smart(
     response_or_ids: dict | tuple,
-    keys: list[str],
+    key: str,
     api_base: str,
     max_retries: int,
     tried_video_id: Optional[set] = None,
 ) -> dict:
-    """智能选择查询方式：优先 video_id（推荐），否则 task_id 兜底
+    """v3.2.0: 单 key 粘性查询
 
     接受两种入参：
     - dict: 从 dict 里提取 video_id / task_id
@@ -525,6 +563,10 @@ def get_status_smart(
       401/403/5xx 是 key 或服务端问题，task_id 端点用同一 key 必然同样错，不该 fallback
     - P0-C：用 `tried_video_id` 集合记录已确认 404 的 video_id，
       调用方（poll_task）累计到 VIDEO_ID_404_LIMIT 时抛错退出，避免死循环到 timeout
+
+    v3.2.0 行为：
+    - 入参从 `keys: list` 改成 `key: str`：整个 poll 用同一把 key
+      → 避免一个视频 poll 把 4 把 key 的 RPM 全部烧光
     """
     if isinstance(response_or_ids, dict):
         video_id = extract_video_id(response_or_ids)
@@ -536,7 +578,7 @@ def get_status_smart(
 
     if video_id and video_id not in tried:
         try:
-            return get_status_by_video_id(video_id, keys, api_base, max_retries)
+            return get_status_by_video_id(video_id, key, api_base, max_retries)
         except ApiError as exc:
             # P0-D: fallback 只在 404（资源不存在）时触发
             if exc.status == 404:
@@ -551,7 +593,7 @@ def get_status_smart(
                 raise
 
     if task_id:
-        return get_status_by_task_id(task_id, keys, api_base, max_retries)
+        return get_status_by_task_id(task_id, key, api_base, max_retries)
     if tried and not task_id:
         # 之前 video_id 404 但 task_id 是 None → 资源真的不存在，不再重试
         raise ApiError(
@@ -569,12 +611,21 @@ def get_status_smart(
 def poll_task(
     video_id: Optional[str],
     task_id: Optional[str],
-    keys: list[str],
+    key: str,
     api_base: str,
     interval: float,
     timeout: float,
     max_retries: int,
 ) -> dict[str, Any]:
+    """v3.2.0: 粘性单 key 轮询
+
+    关键改动：
+    - 入参从 `keys: list` 改成 `key: str`：整个 poll 周期只用一把 key
+    - 间隔默认 5s + 30 分钟超时：4 把 key 时一个视频占 1 把 ~5 RPM × 30 min = 150 calls
+      单 key 完全可以 cover（v3.2.0 之前：一次失败轮询 4 把 key = 4 × 150 = 600 calls）
+    - 5xx/429 时 sleep interval 后重试（不换 key）
+    - 401/403 抛 KeyDeadError → 上层 catch 后换 key 重新 poll
+    """
     deadline = time.time() + timeout
     last_response: dict[str, Any] | None = None
     last_progress = -1
@@ -583,7 +634,7 @@ def poll_task(
     while time.time() <= deadline:
         try:
             response = get_status_smart(
-                (video_id, task_id), keys, api_base, max_retries,
+                (video_id, task_id), key, api_base, max_retries,
                 tried_video_id=tried_video_id,
             )
         except ApiError as exc:
@@ -670,8 +721,12 @@ def _print_agent_success(
     prompt: str,
     size: str = "",
     seconds: str = "",
+    key_fp: str = "",
 ) -> None:
-    """agent 模式成功输出：结构化 key-value，每行一个字段"""
+    """agent 模式成功输出：结构化 key-value，每行一个字段
+
+    v3.2.0 改动：加 key_fp 字段（last-used key 指纹），方便主人看哪个 key 跑完的
+    """
     print("STATUS: ok")
     if path:
         print(f"PATH: {path}")
@@ -684,6 +739,8 @@ def _print_agent_success(
         print(f"SIZE: {size}")
     if seconds:
         print(f"SECONDS: {seconds}")
+    if key_fp:
+        print(f"KEY: {key_fp}")
     # PROMPT 放最后（可能很长，但 agent 可以选择忽略）
     print(f"PROMPT: {prompt}")
 
@@ -696,10 +753,16 @@ def _print_agent_error(message: str, status: Optional[int] = None) -> None:
         print(f"HTTP_STATUS: {status}")
 
 
-def _print_agent_submitted(video_id: Optional[str], task_id: Optional[str], prompt: str = "") -> None:
+def _print_agent_submitted(
+    video_id: Optional[str],
+    task_id: Optional[str],
+    prompt: str = "",
+    key_fp: str = "",
+) -> None:
     """--no-poll 模式：只提交不轮询
 
     v3.1.2 改动：加 prompt 参数（agent 模式可选），方便后续 record
+    v3.2.0 改动：加 key_fp 字段
     （PROMPT 放最后一行，agent 可以选择性忽略）
     """
     print("STATUS: submitted")
@@ -707,6 +770,8 @@ def _print_agent_submitted(video_id: Optional[str], task_id: Optional[str], prom
         print(f"VIDEO_ID: {video_id}")
     if task_id:
         print(f"TASK_ID: {task_id}")
+    if key_fp:
+        print(f"KEY: {key_fp}")
     if prompt:
         print(f"PROMPT: {prompt}")
 
@@ -768,15 +833,48 @@ def cmd_create(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        response = create_task(args, keys)
-    except ApiError as exc:
-        if args.format == "agent":
-            _print_agent_error(str(exc), exc.status)
+    # v3.2.0: KeyPool 粘性轮换
+    pool = get_key_pool(keys)
+    # 最大换 key 次数 = pool 大小（4 把 key 最多换 3 次 + 第一次 = 4 次）
+    max_key_swaps = len(pool)
+    last_exc: Optional[ApiError] = None
+    for swap_round in range(max_key_swaps):
+        key = pool.acquire_key()
+        key_fp = _key_fingerprint(key)
+        try:
+            response = create_task(args, key)
+        except KeyDeadError as exc:
+            # 401/403 → 这把 key 死了，标记后换下一把
+            pool.mark_dead(key)
+            last_exc = exc
+            print(
+                f"# [cmd_create] swap round {swap_round + 1}/{max_key_swaps}: "
+                f"key {key_fp} dead, trying next",
+                file=sys.stderr,
+            )
+            continue
+        except ApiError as exc:
+            # 其他错误（4xx 业务、5xx 重试耗尽等）→ 不换 key，直接报
+            if args.format == "agent":
+                _print_agent_error(str(exc), exc.status)
+                return 1
+            print(f"Agnes API error: {exc}", file=sys.stderr)
+            if exc.payload is not None:
+                print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
-        print(f"Agnes API error: {exc}", file=sys.stderr)
-        if exc.payload is not None:
-            print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
+
+        # create 成功 → 标记 key 已用
+        pool.mark_used(key)
+        break  # 跳出 swap 循环
+    else:
+        # 所有 key 都死了（4 把都 401/403）→ 报错
+        msg = f"All {len(pool)} key(s) returned 401/403 (auth/quota exhausted)"
+        if last_exc is not None:
+            msg += f"\n  Last error: {last_exc}"
+        if args.format == "agent":
+            _print_agent_error(msg, status=last_exc.status if last_exc else None)
+            return 1
+        print(f"Error: {msg}", file=sys.stderr)
         return 1
 
     video_id = extract_video_id(response)
@@ -784,23 +882,58 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     if args.no_poll:
         if args.format == "agent":
-            _print_agent_submitted(video_id, task_id, prompt=args.prompt)
+            _print_agent_submitted(video_id, task_id, prompt=args.prompt, key_fp=key_fp)
         else:
             print(json.dumps(response, ensure_ascii=False, indent=2))
         return 0
 
-    try:
-        final = poll_task(
-            video_id, task_id, keys, args.api_base,
-            args.poll_interval, args.timeout, args.max_retries,
-        )
-    except ApiError as exc:
-        if args.format == "agent":
-            _print_agent_error(str(exc), exc.status)
+    # v3.2.0: poll 继续用同一把 key（粘性），如果死了再换 + 重 poll
+    # 这里 key 还是上面 acquire 的那把；poll 过程中如果 KeyDeadError，需要 swap
+    # 简化实现：poll 用现成 key，KeyDeadError 时换 key 重 poll
+    final: Optional[dict[str, Any]] = None
+    for poll_swap_round in range(max_key_swaps):
+        try:
+            final = poll_task(
+                video_id, task_id, key, args.api_base,
+                args.poll_interval, args.timeout, args.max_retries,
+            )
+            # poll 成功 → 这把 key 也算"用过"了（更新 last_used）
+            pool.mark_used(key)
+            break
+        except KeyDeadError as exc:
+            pool.mark_dead(key)
+            print(
+                f"# [cmd_create/poll] swap round {poll_swap_round + 1}/{max_key_swaps}: "
+                f"key {key_fp} dead during poll, trying next",
+                file=sys.stderr,
+            )
+            # 重新拿一把
+            try:
+                key = pool.acquire_key()
+                key_fp = _key_fingerprint(key)
+            except Exception as e:  # noqa: BLE001
+                if args.format == "agent":
+                    _print_agent_error(f"No more healthy keys: {e}")
+                    return 1
+                print(f"Error: No more healthy keys: {e}", file=sys.stderr)
+                return 1
+            continue
+        except ApiError as exc:
+            if args.format == "agent":
+                _print_agent_error(str(exc), exc.status)
+                return 1
+            print(f"Agnes API error: {exc}", file=sys.stderr)
+            if exc.payload is not None:
+                print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
-        print(f"Agnes API error: {exc}", file=sys.stderr)
-        if exc.payload is not None:
-            print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
+
+    if final is None:
+        # 所有 key 在 poll 阶段都死了
+        msg = f"All {len(pool)} key(s) died during polling"
+        if args.format == "agent":
+            _print_agent_error(msg, status=401)
+            return 1
+        print(f"Error: {msg}", file=sys.stderr)
         return 1
 
     video_url = extract_video_url(final)
@@ -830,13 +963,14 @@ def cmd_create(args: argparse.Namespace) -> int:
 
     if args.format == "agent":
         size, seconds = _final_response_size_seconds(final)
-        _print_agent_success(path, video_url, video_id, task_id, args.prompt, size, seconds)
+        _print_agent_success(path, video_url, video_id, task_id, args.prompt, size, seconds, key_fp=key_fp)
         return 0
 
     # json / human 模式：dump 完整响应 + 下载路径
     output = dict(final)
     if path:
         output["local_path"] = str(path)
+    output["key"] = key_fp
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 
@@ -851,23 +985,59 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        if args.wait:
-            final = poll_task(
-                args.video_id, args.task_id, keys, args.api_base,
-                args.poll_interval, args.timeout, args.max_retries,
+    # v3.2.0: KeyPool 粘性（这里选 1 把 key 用于本次 status 查询）
+    # 注：如果该任务之前是 cmd_create 起的，理论上应该用同一把 key。
+    #     但纯内存版跨调用不记 task→key 映射，所以这里用 round-robin 重新拿一把。
+    #     后果是：1 个视频的 status 查询可能会换 1 把 key（不会撞 RPM，因为是单次查询）。
+    pool = get_key_pool(keys)
+    max_key_swaps = len(pool)
+    last_exc: Optional[ApiError] = None
+
+    final: Optional[dict[str, Any]] = None
+    key: Optional[str] = None
+    key_fp: str = ""
+    for swap_round in range(max_key_swaps):
+        key = pool.acquire_key()
+        key_fp = _key_fingerprint(key)
+        try:
+            if args.wait:
+                final = poll_task(
+                    args.video_id, args.task_id, key, args.api_base,
+                    args.poll_interval, args.timeout, args.max_retries,
+                )
+            else:
+                final = get_status_smart(
+                    (args.video_id, args.task_id), key, args.api_base, args.max_retries
+                )
+            # 成功 → 标记 used
+            pool.mark_used(key)
+            break
+        except KeyDeadError as exc:
+            pool.mark_dead(key)
+            last_exc = exc
+            print(
+                f"# [cmd_status] swap round {swap_round + 1}/{max_key_swaps}: "
+                f"key {key_fp} dead, trying next",
+                file=sys.stderr,
             )
-        else:
-            final = get_status_smart(
-                (args.video_id, args.task_id), keys, args.api_base, args.max_retries
-            )
-    except ApiError as exc:
-        if args.format == "agent":
-            _print_agent_error(str(exc), exc.status)
+            continue
+        except ApiError as exc:
+            if args.format == "agent":
+                _print_agent_error(str(exc), exc.status)
+                return 1
+            print(f"Agnes API error: {exc}", file=sys.stderr)
+            if exc.payload is not None:
+                print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
             return 1
-        print(f"Agnes API error: {exc}", file=sys.stderr)
-        if exc.payload is not None:
-            print(json.dumps(exc.payload, ensure_ascii=False, indent=2), file=sys.stderr)
+
+    if final is None:
+        msg = f"All {len(pool)} key(s) returned 401/403 (auth/quota exhausted)"
+        if last_exc is not None:
+            msg += f"\n  Last error: {last_exc}"
+        if args.format == "agent":
+            _print_agent_error(msg, status=last_exc.status if last_exc else None)
+            return 1
+        print(f"Error: {msg}", file=sys.stderr)
         return 1
 
     video_url = extract_video_url(final)
@@ -887,13 +1057,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         size, seconds = _final_response_size_seconds(final)
         _print_agent_success(
             path, video_url or "(no url)", args.video_id, args.task_id,
-            prompt="(status check)", size=size, seconds=seconds,
+            prompt="(status check)", size=size, seconds=seconds, key_fp=key_fp,
         )
         return 0
 
     output = dict(final)
     if path:
         output["local_path"] = str(path)
+    output["key"] = key_fp
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 

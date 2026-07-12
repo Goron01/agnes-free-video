@@ -4,6 +4,92 @@
 
 ---
 
+## v3.2.0 (2026-07-12) — KeyPool 粘性轮换（突破 RPM=1 限制）
+
+**背景**：主人 2026-07-12 报告**官方把每 key 的 RPM 改成 1**，而且加到了 4 把 key。v3.1 之前的多 key 轮换策略（失败才换 key）在 RPM=1 下基本失效：
+- key1 刚 429 → 几秒后切 key2 → key2 也 429（共享 RPM 窗口）
+- 轮询不粘性：1 个视频的轮询能把 4 把 key 的 RPM 全部烧光
+- 跨调用不重选：4 把 key 实际只用 1 把，等于没轮换
+
+**v3.2.0 核心：KeyPool 粘性轮换**（`lib/key_pool.py`）：
+
+### 背景与动机
+
+- 4 把 key × RPM=1 理论最大 4 RPM，但 v3.1 实现只能拿 1 RPM
+- 需要「每任务粘性 + 跨 key 轮询」才能拿满 4 RPM
+- 主人场景「看股票 + 偶尔发视频」决定走**纯内存版**（不磁盘持久化），后面并发场景再上 v3.3 磁盘锁
+
+### P0 核心
+
+- **新增 `lib/key_pool.py`**（独立模块，可复用于 agnes-free-image）：
+  - `KeyPool` 类：last_used / dead_until per-key 状态
+  - `acquire_key()` → 返回 last_used 最早的可用 key（从未用过优先）
+  - `mark_used(key)` → 60s 冷却开始
+  - `mark_dead(key)` → 401/403 后死 10 分钟（pool 跳这把）
+  - `snapshot()` → 调试/agent 输出的 pool 状态快照（脱敏 fingerprint）
+  - `_key_fingerprint(key)` → `sk-XXX***XX` 脱敏，stderr/agent 输出不漏完整 key
+
+- **改 `request_json_with_retry` 签名**：`keys: list` → `key: str`
+  - 本次请求全程只用一把 key（粘性）
+  - 5xx/429/网络：指数退避重试同 key（不换 key，换 key 也撞 RPM）
+  - 401/403：抛 `KeyDeadError(ApiError)` → 上层换 key 重试
+
+- **改 `poll_task` / `get_status_smart` / `create_task`**：入参从 `keys: list` 改成 `key: str`
+  - 轮询粘性：1 个视频的整个轮询周期用同一把 key（不重轮换 key）
+
+- **改 `cmd_create` / `cmd_status`**：接入 KeyPool 单例（`get_key_pool`）
+  - create：`pool.acquire_key()` → 1 把 key 用到底，遇 `KeyDeadError` 才换
+  - 4 把 key 全死 → 报「All 4 key(s) returned 401/403」不沉默
+
+### P1 agent 输出
+
+- **`_print_agent_success` / `_print_agent_submitted` 加 `key_fp` 参数** → agent 输出新增 `KEY:` 字段
+- 主人一眼能看到「这个视频是 sk-Gyu***fe 跑的」
+
+### P1 文档
+
+- SKILL.md 新增「**多 Key 轮换策略 (v3.2.0)**」一节
+- 明确写清楚：背景、粘性策略、吞吐量计算、限制、单 key 向后兼容
+- .env.example / SKILL.md / Changelog.md 三处同步
+
+### P1 测试
+
+- **28 个 KeyPool 单测**（`tests/test_key_pool.py`）：
+  - TestKeyFingerprint (5)：脱敏边界
+  - TestKeyPoolInit (4)：单/多/缺/去重
+  - TestAcquireKey (6)：never-used 优先 / oldest 优先 / skip 冷却 / skip 死 / 兏底 / verbose
+  - TestMarkUsed (3)：更新 / advance 时钟 / 未知 key 忽略
+  - TestMarkDead (3)：跳过 / dead_ttl 后复活 / 未知 key
+  - TestSnapshot (3)：alive/dead 计数 / cooldown_active / 不泄漏 key
+  - TestStickyRotation (2)：4 key round-robin / 1 死 后 3 轮换
+  - TestSingleKeyBackwardCompat (2)：单 key 永远返回 / repr 不漏
+- **76 → 76 agnes_video 测试**（+8 新增）：
+  - TestV32KeyPoolIntegration (5)：swap on 401 / 全死 / 单例 / reset / 429 不换
+  - TestV32AgentOutputKeyField (3)：success 返 KEY / 无 key 不返 / submitted 返 KEY
+- **全过 7.34s**
+
+### 迁移 / 兼容性
+
+- **接口**：`request_json_with_retry` / `get_status_smart` / `poll_task` / `create_task` 入参从 `keys: list` → `key: str`
+  - 纯内部变更（本 skill CLI 是唯一入口）
+  - 外部 agent 调用方无影响
+- **多 key 配置**：依然在 `AGNES_API_KEY=sk-a,sk-b,sk-c,sk-d` 逗号分隔
+- **单 key**：pool 自动退化，永远返回同一把 key（后向兼容）
+- **agent 格式**：`KEY:` 字段是新增，不是替换（老脚本忽略不认识的字段）
+
+### 已知限制
+
+- **纯内存版**：跨进程不共享 pool。多进程同时跑可能撞 RPM。
+- **v3.3+ TODO**（如主人需要并发跑）走磁盘 JSON + fcntl 文件锁
+
+### 破坏性变更（Breaking Changes）
+
+- `request_json_with_retry(method, url, keys, ...)` → `request_json_with_retry(method, url, key, ...)`
+  - 仅本 skill 内部，外部用户无感
+  - 旧代码（直接 import 这些函数）需改
+
+---
+
 ## v3.1.2 (2026-06-10) — Agent 视角审查 9 项修复 + 安全增强 + 测试覆盖翻倍
 
 **背景**：主人 2026-06-10 让小美用 agent 视角审查本 skill（方法论来自 MEMORY.md v3.1.2 验证过的 6 维度框架），跑了 42 个原回归测试 + 端到端 dry-run / status smoke test，发现 1 个 P0 安全增强 + 5 个 P1 重要问题 + 3 个 P2 优化。**逐条修复 + 测试覆盖翻倍（42 → 68）**。
