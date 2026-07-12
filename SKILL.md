@@ -1,7 +1,7 @@
 ---
 name: agnes-free-video
 version: 3.2.2
-description: "Agnes-Video 文生视频/图生视频/关键帧。v3.2.0 起 4 key 粘性轮换（RPM=1 安全）。触发：文生视频、图生视频"
+description: "Agnes-Video 文生视频/图生视频/关键帧。触发：文生视频、图生视频"
 emoji: 🎬
 primaryEnv: AGNES_API_KEY
 requires:
