@@ -66,6 +66,8 @@ python3 scripts/agnes_video.py status --task-id smoke-test --format agent
 
 支持多 key 轮换（逗号分隔）：`AGNES_API_KEY=sk-a,sk-b,sk-c`
 
+环境变量名等价：`AGNES_TOKEN` 也可用（与 `AGNES_API_KEY` 同义，脚本同时认两者；XDG / skill 本地 .env 里两个名字也认）
+
 ## Quick Start (Agent 视角)
 
 **默认输出格式：`agent`**，stdout 输出结构化 `STATUS/PATH/URL/VIDEO_ID/...`，错误也走 stdout（agent 一定看得到）。

@@ -13,7 +13,7 @@
 
 ## 触发词
 
-免费视频、生成视频、AI 视频、agnes-video、video generation
+文生视频、图生视频、关键帧
 
 ## 安装
 
@@ -35,6 +35,8 @@ export AGNES_API_KEY=sk-xxx
 ```
 
 多 key 用逗号分隔：`AGNES_API_KEY=sk-a,sk-b,sk-c,sk-d`
+
+环境变量名等价：`AGNES_TOKEN` 也可用（与 `AGNES_API_KEY` 同义，脚本同时认两者）
 
 ## 快速开始
 
