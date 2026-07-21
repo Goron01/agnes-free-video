@@ -190,7 +190,7 @@
   - TestSnapshot (3)：alive/dead 计数 / cooldown_active / 不泄漏 key
   - TestStickyRotation (2)：4 key round-robin / 1 死 后 3 轮换
   - TestSingleKeyBackwardCompat (2)：单 key 永远返回 / repr 不漏
-- **76 → 76 agnes_video 测试**（+8 新增）：
+- **68 → 76 agnes_video 测试**（+8 新增）：
   - TestV32KeyPoolIntegration (5)：swap on 401 / 全死 / 单例 / reset / 429 不换
   - TestV32AgentOutputKeyField (3)：success 返 KEY / 无 key 不返 / submitted 返 KEY
 - **全过 7.34s**
